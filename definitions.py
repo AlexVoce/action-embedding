@@ -16,9 +16,10 @@ paper_model_path = MODELS_DIR / "paper"
 fig_dir = FIGURES_DIR
 initial_learning_fig_dir = FIGURES_DIR
 paper_fig_dir = FIGURES_DIR / "paper"
+revision_fig_dir = FIGURES_DIR / "revision_figures"  # all revision (reviewer-response) figures
 
 # Create directories if missing
-for p in [DATA_DIR, MODELS_DIR, FIGURES_DIR, paper_model_path, paper_fig_dir]:
+for p in [DATA_DIR, MODELS_DIR, FIGURES_DIR, paper_model_path, paper_fig_dir, revision_fig_dir]:
     p.mkdir(parents=True, exist_ok=True)
 
 # Example model filename (for reference)

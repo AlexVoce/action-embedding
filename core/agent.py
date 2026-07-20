@@ -128,9 +128,12 @@ class ActionMapping(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim, embedding_dim, xavier=False):
+    def __init__(self, state_dim, embedding_dim, xavier=False, apply_tanh=True):
         super(Actor, self).__init__()
         self.mean_head = nn.Linear(state_dim, embedding_dim)
+        self.apply_tanh = apply_tanh  # if False, output an UNBOUNDED mean (single-tanh policy):
+        # select_action then applies one tanh, so the policy embedding can reach the full ring
+        # radius instead of being double-squashed inside it.
         nn.init.normal_(self.mean_head.weight, mean=0.0, std=1e-2)
         if xavier:
             nn.init.xavier_uniform_(self.mean_head.weight)
@@ -139,9 +142,8 @@ class Actor(nn.Module):
         nn.init.constant_(self.mean_head.bias, 0.0)
 
     def forward(self, state):
-        # todo: check if we need activation function to make the mean between -1 and 1
         mean = self.mean_head(state)
-        return torch.tanh(mean) # Output embedding
+        return torch.tanh(mean) if self.apply_tanh else mean  # Output embedding
         # I think a learnable std might be necessary - it's struggling with exploration currently
 
 
@@ -192,9 +194,12 @@ class ACLearningAgentWithEmbedding:
         self.policy_noise = config["policy_noise"]  # this is in action space (overall policy)
         self.embedding_dim = config['embedding_dim']
         # option to load a fully trained model
+        # adaptation-fix toggles (default off -> original behaviour, banked results unaffected)
+        self._actor_tanh = config.get('actor_tanh', True)   # False = remove double-tanh
+        self._zero_f_bias = config.get('zero_f_bias', False)  # True = angle-only (radius-independent) decode
         if not full_model_load_path:
             # Actor-critic
-            self.actor = Actor(state_dim, self.embedding_dim)
+            self.actor = Actor(state_dim, self.embedding_dim, apply_tanh=self._actor_tanh)
             self.critic = Critic(state_dim)
         else:
             checkpoint_fully_trained = torch.load(full_model_load_path)
@@ -211,7 +216,7 @@ class ACLearningAgentWithEmbedding:
             self.g.load_state_dict(checkpoint_fully_trained['g_state_dict'])
             self.f.load_state_dict(checkpoint_fully_trained['f_state_dict'])
 
-            self.actor = Actor(state_dim, self.embedding_dim)
+            self.actor = Actor(state_dim, self.embedding_dim, apply_tanh=self._actor_tanh)
             self.critic = Critic(state_dim)
             self.actor.load_state_dict(checkpoint_fully_trained['actor_state_dict'])
             self.critic.load_state_dict(checkpoint_fully_trained['critic_state_dict'])
@@ -238,6 +243,11 @@ class ACLearningAgentWithEmbedding:
             self.g.load_state_dict(checkpoint['g_state_dict'])
             self.f.load_state_dict(checkpoint['f_state_dict'])
 
+        if self._zero_f_bias:
+            # make the decoder decode by embedding ANGLE only (radius-independent), so decoder
+            # adaptation on the ring transfers to the policy's interior operating point.
+            self.f.linear.bias.data.zero_()
+            self.f.linear.bias.requires_grad_(False)
         if not actor_plastic:
             self.actor_lr = 0
         if not critic_plastic:
