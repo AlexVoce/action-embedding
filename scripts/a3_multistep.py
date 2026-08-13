@@ -135,6 +135,7 @@ def main():
     ap.add_argument("--max_steps", type=int, default=10)
     ap.add_argument("--emb_iter", type=int, default=120000)
     ap.add_argument("--episodes", type=int, default=150000)
+    ap.add_argument("--plot_only", action="store_true", help="skip the sim; replot from the saved json")
     args = ap.parse_args()
     torch.set_num_threads(4)
     cfg = {**BASE, "seed": args.seed, "max_steps": args.max_steps}
@@ -142,14 +143,22 @@ def main():
     env = MultiStepReach(cfg, step_size=args.step_size)
     print("target at distance %.2f, step %.2f -> ~%d steps needed; max_steps=%d"
           % (cfg["reach_length"], args.step_size, int(np.ceil(cfg["reach_length"] / args.step_size)), args.max_steps), flush=True)
-    cache = str(Path(revision_fig_dir).parent / "paper" / f"a3_embedding_seed{args.seed}.pth")
-    g, f = train_embedding(env, cfg, n_iter=args.emb_iter, cache=cache)
-    print("embedding ready", flush=True)
-    curve, agent = run_policy(env, cfg, g, f, use_embedding=True, episodes=args.episodes)
-    print("[a3] final success rate = %.2f" % curve[-1][1], flush=True)
-    paths = rollout_trajectories(env, agent, n=6)
-    json.dump({"curve": curve, "step_size": args.step_size, "max_steps": args.max_steps},
-              open(Path(revision_fig_dir).parent / "paper" / f"a3_multistep_seed{args.seed}.json", "w"))
+    data_fp = Path(revision_fig_dir).parent / "paper" / f"a3_multistep_seed{args.seed}.json"
+    if args.plot_only:
+        d = json.load(open(data_fp))
+        curve = d["curve"]; paths = [np.array(p) for p in d["paths"]]
+        start_xy = tuple(d["start_xy"]); target_xy = tuple(d["target_xy"]); target_radius = d["target_radius"]
+    else:
+        cache = str(Path(revision_fig_dir).parent / "paper" / f"a3_embedding_seed{args.seed}.pth")
+        g, f = train_embedding(env, cfg, n_iter=args.emb_iter, cache=cache)
+        print("embedding ready", flush=True)
+        curve, agent = run_policy(env, cfg, g, f, use_embedding=True, episodes=args.episodes)
+        print("[a3] final success rate = %.2f" % curve[-1][1], flush=True)
+        paths = rollout_trajectories(env, agent, n=6)
+        start_xy = tuple(env.start_xy); target_xy = tuple(env.target_xy); target_radius = float(env.target_radius)
+        json.dump({"curve": curve, "paths": [p.tolist() for p in paths], "step_size": args.step_size,
+                   "max_steps": args.max_steps, "start_xy": list(start_xy), "target_xy": list(target_xy),
+                   "target_radius": target_radius}, open(data_fp, "w"))
 
     fig, ax = plt.subplots(1, 2, figsize=(8.4, 3.4))
     e = [x for x, _ in curve]; v = [y for _, y in curve]
@@ -158,9 +167,9 @@ def main():
     ax[0].spines[["right", "top"]].set_visible(False)
     for p in paths:
         ax[1].plot(p[:, 0], p[:, 1], "-o", ms=3, alpha=0.7, color="#4477AA")
-    ax[1].plot(*env.start_xy, "ks", ms=8, label="start")
-    tgt = plt.Circle(env.target_xy, env.target_radius, color="#A94850", alpha=0.4, label="target")
-    ax[1].add_patch(tgt); ax[1].plot(*env.target_xy, "r*", ms=10)
+    ax[1].plot(*start_xy, "ks", ms=8, label="start")
+    tgt = plt.Circle(target_xy, target_radius, color="#A94850", alpha=0.4, label="target")
+    ax[1].add_patch(tgt); ax[1].plot(*target_xy, "r*", ms=10)
     ax[1].set(title="example trajectories (step %.2f, ~%d steps)" % (args.step_size, int(np.ceil(cfg["reach_length"] / args.step_size))), aspect="equal")
     ax[1].legend(frameon=False, fontsize=8); ax[1].spines[["right", "top"]].set_visible(False)
     fig.tight_layout()

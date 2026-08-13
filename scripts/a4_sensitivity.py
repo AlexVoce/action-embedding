@@ -37,21 +37,27 @@ def main():
     ap.add_argument("--rotation_deg", type=int, default=-30)
     ap.add_argument("--adapt_episodes", type=int, default=100000)
     ap.add_argument("--out", type=str, default="figures/paper/a4_sensitivity.json")
+    ap.add_argument("--plot_only", action="store_true",
+                    help="skip the sim and replot from the saved --out json")
     args = ap.parse_args()
 
     per_std = defaultdict(list)
-    rows = []
-    for seed in args.seeds:
-        agent, base, acfg = train_adapt("sl", seed, args.target_deg, args.rotation_deg,
-                                        {**BASE}, adapt_episodes=args.adapt_episodes)
-        for std in args.stds:
-            agent.set_policy_std(std)
-            df = calculate_generalization(agent, base, {**acfg, "seed": seed})
-            loc, glob = locality(df)
-            per_std[std].append(loc - glob)
-            rows.append({"seed": seed, "std": std, "local": loc, "global": glob, "locality": loc - glob})
-            print(f"[A4 s{seed} std={std}] locality={loc-glob:.1f} (local={loc:.1f} global={glob:.1f})", flush=True)
-        Path(args.out).write_text(json.dumps(rows, indent=2))
+    if args.plot_only:
+        for r in json.loads(Path(args.out).read_text()):
+            per_std[r["std"]].append(r["locality"])
+    else:
+        rows = []
+        for seed in args.seeds:
+            agent, base, acfg = train_adapt("sl", seed, args.target_deg, args.rotation_deg,
+                                            {**BASE}, adapt_episodes=args.adapt_episodes)
+            for std in args.stds:
+                agent.set_policy_std(std)
+                df = calculate_generalization(agent, base, {**acfg, "seed": seed})
+                loc, glob = locality(df)
+                per_std[std].append(loc - glob)
+                rows.append({"seed": seed, "std": std, "local": loc, "global": glob, "locality": loc - glob})
+                print(f"[A4 s{seed} std={std}] locality={loc-glob:.1f} (local={loc:.1f} global={glob:.1f})", flush=True)
+            Path(args.out).write_text(json.dumps(rows, indent=2))
 
     stds = sorted(per_std)
     means = [np.mean(per_std[s]) for s in stds]

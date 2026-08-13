@@ -14,6 +14,7 @@ embedding recovers joint angles (clean torus => high R^2), and compares against 
 FINGERTIP-state encoder (should stay scrambled).
 """
 import argparse
+import json
 import math
 from pathlib import Path
 
@@ -87,17 +88,30 @@ def main():
     ap.add_argument("--emb_dim", type=int, default=4)
     ap.add_argument("--steps", type=int, default=200000)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--plot_only", action="store_true", help="skip the sim; replot from the saved json")
     args = ap.parse_args()
     torch.set_num_threads(2)
     env = TwoJointArm(args.k)
+    data_fp = Path(revision_fig_dir).parent / "paper" / f"proprio_arm_data_seed{args.seed}.json"
+
+    if args.plot_only:
+        data = json.load(open(data_fp))
+    else:
+        data = {}
+        for mode in ["joint", "fingertip"]:
+            codes, r2_joint, r2_fp = train(env, mode, args.seed, steps=args.steps, emb_dim=args.emb_dim)
+            print(f"[{mode:9s} state] recover JOINT R2={r2_joint:.3f}  recover FINGERTIP R2={r2_fp:.3f}", flush=True)
+            proj = PCA(n_components=2).fit_transform(codes)
+            data[mode] = {"proj": proj.tolist(), "colors": env.levels[env.configs[:, 0]].tolist(),
+                          "r2_joint": float(r2_joint), "r2_fp": float(r2_fp)}
+        json.dump(data, open(data_fp, "w"))
+        print("saved", data_fp.name, flush=True)
 
     fig, axes = plt.subplots(1, 2, figsize=(9, 4.4))
     for ax, mode in zip(axes, ["joint", "fingertip"]):
-        codes, r2_joint, r2_fp = train(env, mode, args.seed, steps=args.steps, emb_dim=args.emb_dim)
-        print(f"[{mode:9s} state] recover JOINT R2={r2_joint:.3f}  recover FINGERTIP R2={r2_fp:.3f}", flush=True)
-        proj = PCA(n_components=2).fit_transform(codes)
-        sc = ax.scatter(proj[:, 0], proj[:, 1], c=env.levels[env.configs[:, 0]], cmap="twilight", s=16)
-        ax.set_title(f"{mode}-state encoder\nrecover joint R^2={r2_joint:.2f}, fingertip R^2={r2_fp:.2f}")
+        d = data[mode]; proj = np.array(d["proj"]); colors = np.array(d["colors"])
+        sc = ax.scatter(proj[:, 0], proj[:, 1], c=colors, cmap="twilight", s=16)
+        ax.set_title(f"{mode}-state encoder\nrecover joint R^2={d['r2_joint']:.2f}, fingertip R^2={d['r2_fp']:.2f}")
         ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); plt.colorbar(sc, ax=ax)
     fig.suptitle("Two-joint arm: proprioceptive (joint) state gives a clean action torus;\n"
                  "fingertip state does not (regressing continuous joint command)", fontsize=10)
