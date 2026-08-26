@@ -61,15 +61,15 @@ class Critic(nn.Module):
 
 def success_rate(pick, env):
     hits = 0
-    for idx in range(env.n_actions):
-        env.sample_target(idx)
+    for idx in range(len(env.eval_targets)):
+        tgt = env.sample_target(idx)                 # fixed continuous reachable target
         a = pick(env.target_features())
-        hits += env.hit(a, env.fingertips[idx])
-    return hits / env.n_actions
+        hits += env.hit(a, tgt)
+    return hits / len(env.eval_targets)
 
 
 def run(kind, env, seed, episodes, embs=None, emb_dim=4, hidden=128, actor_lr=1e-3,
-        crit=0.9, eval_every=5000):
+        crit=0.8, eval_every=5000, temp_max=1.5, temp_min=0.3):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     sd = env.n_features
     critic = Critic(sd)
@@ -94,19 +94,19 @@ def run(kind, env, seed, episodes, embs=None, emb_dim=4, hidden=128, actor_lr=1e
             return actor(s)
 
     a_opt = torch.optim.Adam(params, lr=actor_lr); c_opt = torch.optim.Adam(critic.parameters(), lr=actor_lr * 5)
-    rh = []; window = 300; curve = []; hit_ep = None; sustained = 0
+    curve = []; hit_ep = None; sustained = 0
     for ep in range(episodes):
         env.sample_target(); s = env.target_features()
-        avg = np.mean(rh[-window:]) if len(rh) >= window else -0.1
-        temp = reward_decay(avg, -0.1, 0.4, 3.0, 0.5)
+        temp = temp_min + (temp_max - temp_min) * (1 - ep / episodes)   # gentle episode-annealed exploration
         a_opt.zero_grad(); c_opt.zero_grad()
         logits = pick(s)
         probs = F.softmax(logits / temp, -1); probs = probs + 0.008; probs = probs / probs.sum()
         a = torch.multinomial(probs, 1).item()
-        r = env.reward_of(a)
+        dist = float(np.linalg.norm(env.fingertips[a] - env.target))     # dense, distance-shaped reward
+        r = 1.0 if dist <= env.reward_radius else -0.2 * dist
         v = critic(s); adv = torch.tensor(float(r)) - v
         (-torch.log(probs[a]) * adv.detach()).backward(); adv.pow(2).backward()
-        a_opt.step(); c_opt.step(); rh.append(r)
+        a_opt.step(); c_opt.step()
         if ep % eval_every == 0:
             sr = success_rate(lambda ss: torch.argmax(pick(ss)).item(), env)
             curve.append({"ep": ep, "success": sr})
@@ -125,28 +125,39 @@ def main():
     ap.add_argument("--ks", type=int, nargs="+", default=[8, 16, 24])
     ap.add_argument("--emb_dim", type=int, default=4)
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
-    ap.add_argument("--episodes", type=int, default=120000)
+    ap.add_argument("--episodes", type=int, default=200000)
     ap.add_argument("--emb_steps", type=int, default=200000)
     ap.add_argument("--reward_radius", type=float, default=0.25)
-    ap.add_argument("--emb_state", choices=["joint", "fingertip"], default="joint")
-    ap.add_argument("--out", type=str, default="figures/paper/proprio_reacher_rl.json")
+    # fingertip (consequence) embedding: motor-equivalent configs collapse -> reaching is learnable/scalable.
+    # (joint-state gives the proprioceptive TORUS, which scatters IK solutions and breaks the reaching decode.)
+    ap.add_argument("--emb_state", choices=["joint", "fingertip"], default="fingertip")
+    ap.add_argument("--eval_every", type=int, default=10000)
+    ap.add_argument("--actor_lr", type=float, default=1e-3)
+    # which agents to run (lets us pick the best lr PER agent in one figure: embedding@3e-4, standard@1e-4)
+    ap.add_argument("--agents", nargs="+", choices=["embedding", "standard"], default=["embedding", "standard"])
+    ap.add_argument("--out", type=str, default="figures/paper/proprio_reacher_rl_fixed.json")
     args = ap.parse_args()
-    torch.set_num_threads(1)
+    torch.set_num_threads(4)
     t0 = time.time(); results = []
     for k in args.ks:
         env0 = TwoJointArm(k, reward_radius=args.reward_radius); N = env0.n_actions
-        g, f, embs = train_embedding(TwoJointArm(k, reward_radius=args.reward_radius), 0,
-                                     emb_dim=args.emb_dim, steps=args.emb_steps, emb_state=args.emb_state)
-        print(f"[k={k} N={N}] embedding trained ({args.emb_state}-state, regression)", flush=True)
         for seed in args.seeds:
-            r_emb = run("embedding", TwoJointArm(k, reward_radius=args.reward_radius), seed,
-                        args.episodes, embs=embs, emb_dim=args.emb_dim)
-            r_std = run("standard", TwoJointArm(k, reward_radius=args.reward_radius), seed, args.episodes)
-            for kind, res in [("embedding", r_emb), ("standard", r_std)]:
+            res_by_kind = {}
+            if "embedding" in args.agents:
+                # per-seed embedding (standing fix): retrain per seed so one bad embedding-init can't dent a k
+                g, f, embs = train_embedding(TwoJointArm(k, reward_radius=args.reward_radius), seed,
+                                             emb_dim=args.emb_dim, steps=args.emb_steps, emb_state=args.emb_state)
+                res_by_kind["embedding"] = run("embedding", TwoJointArm(k, reward_radius=args.reward_radius), seed,
+                                               args.episodes, embs=embs, emb_dim=args.emb_dim,
+                                               eval_every=args.eval_every, actor_lr=args.actor_lr)
+            if "standard" in args.agents:
+                res_by_kind["standard"] = run("standard", TwoJointArm(k, reward_radius=args.reward_radius), seed,
+                                              args.episodes, eval_every=args.eval_every, actor_lr=args.actor_lr)
+            for kind, res in res_by_kind.items():
                 results.append({"k": k, "N": N, "seed": seed, "agent": kind, "hit_ep": res["hit_ep"],
                                 "final_success": res["final_success"], "curve": res["curve"]})
                 print(f"[k={k} N={N} s{seed} {kind:<9}] hit_ep={str(res['hit_ep']):<8} success={res['final_success']:.2f}", flush=True)
-        Path(args.out).write_text(json.dumps(results, indent=2))
+            Path(args.out).write_text(json.dumps(results, indent=2))
     print(f"\nSaved to {args.out} in {time.time()-t0:.1f}s", flush=True)
 
 
