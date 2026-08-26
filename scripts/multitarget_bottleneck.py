@@ -49,15 +49,52 @@ class MultiTargetReach(ReachTask):
         self._center = (self.env_shape[0] / 2, self.env_shape[1] / 2)
         self.reach_length = cfg["reach_length"]
         self.target_idx = 0
+        # CONSTANT-DIFFICULTY mode: continuous target angles (not the action grid) with a fixed
+        # angular success tolerance. For N>=9 every continuous target has an action within tol,
+        # so ceiling=1.0 at every N (no spacing-vs-TOL artifact e.g. the old N=16 dip) and the
+        # axis measured is pure action SELECTION -> baselines can tie SL at low N.
+        self.continuous = bool(cfg.get("continuous_targets", False))
+        self.angular_tol = np.radians(cfg.get("angular_tol_deg", 20.0))
+        self.target_angle = float(self.actions[0])
+        if self.continuous:
+            rng = np.random.RandomState(12345)
+            evs, tol = [], np.radians(20.0)      # fixed 20deg eval set (reachable-only)
+            while len(evs) < cfg.get("n_eval", 500):
+                th = rng.uniform(0, 2 * np.pi)
+                if np.min(np.abs(np.angle(np.exp(1j * (self.actions - th))))) <= tol:
+                    evs.append(th)
+            self.eval_target_angles = np.array(evs)
+        else:
+            self.eval_target_angles = self.actions
+
+    def _rand_reachable_angle(self):
+        while True:
+            th = np.random.uniform(0, 2 * np.pi)
+            if np.min(np.abs(np.angle(np.exp(1j * (self.actions - th))))) <= self.angular_tol:
+                return th
+
+    def set_angular_tol(self, tol_rad):
+        self.angular_tol = float(tol_rad)
 
     def sample_target(self, idx=None):
-        self.target_idx = np.random.randint(self.n_actions) if idx is None else idx
-        theta = self.actions[self.target_idx]
+        if self.continuous:
+            theta = self._rand_reachable_angle() if idx is None else float(self.eval_target_angles[idx])
+        else:
+            self.target_idx = np.random.randint(self.n_actions) if idx is None else idx
+            theta = self.actions[self.target_idx]
+        self.target_angle = float(theta)
         self.reach_angle = theta
         self.target_xy = (self._center[0] + self.reach_length * np.cos(theta),
                           self._center[1] + self.reach_length * np.sin(theta))
         self.current_xy = self._center
         return self.target_idx
+
+    def get_reward(self, next_xy):
+        if not self.continuous:
+            return super().get_reward(next_xy)
+        ang = math.atan2(next_xy[1] - self._center[1], next_xy[0] - self._center[0])
+        err = abs(np.angle(np.exp(1j * (ang - self.target_angle))))
+        return self.reward_value if err <= self.angular_tol else self.penalty_for_miss
 
     def reset(self):
         self.current_xy = self._center
@@ -119,18 +156,20 @@ def ring_score(codes_2d, target_angles):
     return float((a * t).sum() / denom) if denom > 0 else 0.0
 
 
-def eval_greedy(actor, env, agent_kind):
-    """Mean greedy angular error (deg) over all targets; + 2-D codes if applicable."""
-    errs, codes, tangs = [], [], []
+def eval_greedy(actor, env, agent_kind, tol_deg=20.0):
+    """Mean greedy angular error (deg) + within-tol success rate over the eval targets; + 2-D codes."""
+    errs, codes, tangs, hits = [], [], [], 0
     with torch.no_grad():
-        for idx in range(env.n_actions):
+        for idx in range(len(env.eval_target_angles)):
             env.sample_target(idx); s = env.target_features()
             a_idx = torch.argmax(actor(s)).item()
-            errs.append(angular_err(env, env.actions[a_idx], env.actions[idx]))
-            tangs.append(env.actions[idx])
+            e = angular_err(env, env.actions[a_idx], env.target_angle)
+            errs.append(e); hits += int(e <= tol_deg)
+            tangs.append(env.target_angle)
             if agent_kind in ("bottleneck", "sl"):
                 codes.append(actor.bottleneck(s).numpy())
-    return float(np.mean(errs)), (np.array(codes) if codes else None), np.array(tangs)
+    return (float(np.mean(errs)), (np.array(codes) if codes else None),
+            np.array(tangs), hits / len(env.eval_target_angles))
 
 
 def train_base(agent_kind, seed, cfg, episodes, actor_lr=1e-4, critic_lr=5e-4,
@@ -160,16 +199,25 @@ def train_base(agent_kind, seed, cfg, episodes, actor_lr=1e-4, critic_lr=5e-4,
         env.sample_target()
         s = env.target_features()
         avg = np.mean(reward_hist[-window:]) if len(reward_hist) >= window else -0.1
-        std_expl = reward_decay(avg, -0.1, cfg["max_reward_policy_annealing"], 3.0, 0.5)  # softmax temp
-        env.set_target_radius(reward_decay(avg, -0.1, cfg["max_reward_target_annealing"],
-                                           cfg["reward_radius_max"], cfg["reward_radius_min"]))
+        if getattr(env, "continuous", False):
+            # proven two-joint recipe: gentle episode-annealed temp + dense reward, fixed difficulty
+            std_expl = 0.3 + 1.2 * (1 - ep / episodes)          # temp 1.5 -> 0.3 over training
+            env.set_angular_tol(np.radians(20.0))
+        else:
+            std_expl = reward_decay(avg, -0.1, cfg["max_reward_policy_annealing"], 3.0, 0.5)  # softmax temp
+            env.set_target_radius(reward_decay(avg, -0.1, cfg["max_reward_target_annealing"],
+                                               cfg["reward_radius_max"], cfg["reward_radius_min"]))
         a_opt.zero_grad(); c_opt.zero_grad()
         logits = actor(s)
         probs = F.softmax(logits / std_expl, dim=-1)
         probs = probs + cfg["policy_noise"]; probs = probs / probs.sum()
         a_idx = torch.multinomial(probs, 1).item()
         action = env.actions[a_idx]
-        nxt, reward, done = env.act(action)
+        if getattr(env, "continuous", False):
+            err = abs(np.angle(np.exp(1j * (action - env.target_angle))))  # dense distance-shaped reward
+            reward = 1.0 if err <= env.angular_tol else -0.2 * (err / np.pi)
+        else:
+            nxt, reward, done = env.act(action)
         value = critic(s)
         adv = torch.tensor(float(reward)) - value
         (-torch.log(probs[a_idx]) * adv.detach()).backward()
@@ -177,8 +225,8 @@ def train_base(agent_kind, seed, cfg, episodes, actor_lr=1e-4, critic_lr=5e-4,
         a_opt.step(); c_opt.step()
         reward_hist.append(reward)
         if ep % eval_every == 0:
-            gerr, _, _ = eval_greedy(actor, env, agent_kind)
-            curve.append({"ep": ep, "greedy_err": gerr,
+            gerr, _, _, succ = eval_greedy(actor, env, agent_kind)
+            curve.append({"ep": ep, "greedy_err": gerr, "success": succ,
                           "avg_reward": float(np.mean(reward_hist[-window:]))})
             if gerr < crit_deg:
                 sustained += 1
@@ -188,18 +236,18 @@ def train_base(agent_kind, seed, cfg, episodes, actor_lr=1e-4, critic_lr=5e-4,
                 sustained = 0
             if ep % 25000 == 0:
                 print(f"[{agent_kind} s{seed} N={env.n_actions}] ep {ep} "
-                      f"greedy_err={gerr:.1f} avg_reward={np.mean(reward_hist[-window:]):.3f}", flush=True)
+                      f"greedy_err={gerr:.1f} success={succ:.3f} avg_reward={np.mean(reward_hist[-window:]):.3f}", flush=True)
 
-    mean_err, codes, tangs = eval_greedy(actor, env, agent_kind)
+    mean_err, codes, tangs, final_success = eval_greedy(actor, env, agent_kind)
     rscore = ring_score(codes, tangs) if codes is not None else float("nan")
     print(f"[{agent_kind} s{seed} N={env.n_actions}] DONE mean_greedy_err={mean_err:.2f}deg  "
-          f"hit_ep={hit_ep}  ring_score={rscore:.3f}", flush=True)
+          f"success={final_success:.3f}  hit_ep={hit_ep}  ring_score={rscore:.3f}", flush=True)
 
     out = Path(paper_model_path) / f"multitarget_{agent_kind}{tag}_seed{seed}_nact{env.n_actions}.pth"
     torch.save({"actor": actor.state_dict(), "critic": critic.state_dict(),
                 "kind": agent_kind, "n_actions": env.n_actions, "state_dim": sd,
-                "mean_greedy_err": mean_err, "ring_score": rscore,
-                "hit_ep": hit_ep, "curve": curve, "seed": seed,
+                "mean_greedy_err": mean_err, "final_success": final_success, "ring_score": rscore,
+                "hit_ep": hit_ep, "curve": curve, "seed": seed, "continuous": getattr(env, "continuous", False),
                 "actor_lr": actor_lr, "critic_lr": critic_lr, "episodes": episodes, "crit_deg": crit_deg}, out)
     print(f"[{agent_kind} s{seed}] saved {out.name}", flush=True)
 
@@ -213,11 +261,16 @@ def main():
     ap.add_argument("--episodes", type=int, default=300000)
     ap.add_argument("--crit_deg", type=float, default=20.0)
     ap.add_argument("--actor_lr", type=float, default=1e-4)
+    ap.add_argument("--continuous_targets", action="store_true")  # constant-difficulty continuous targets
+    ap.add_argument("--n_eval", type=int, default=500)
+    ap.add_argument("--eval_every", type=int, default=5000)
     ap.add_argument("--tag", type=str, default="")  # appended to saved filename
     args = ap.parse_args()
-    cfg = {**BASE, "num_actions": args.num_actions}
+    torch.set_num_threads(4)
+    cfg = {**BASE, "num_actions": args.num_actions,
+           "continuous_targets": args.continuous_targets, "n_eval": args.n_eval}
     train_base(args.agent, args.seed, cfg, args.episodes, actor_lr=args.actor_lr,
-               critic_lr=args.actor_lr * 5, crit_deg=args.crit_deg, tag=args.tag)
+               critic_lr=args.actor_lr * 5, crit_deg=args.crit_deg, eval_every=args.eval_every, tag=args.tag)
 
 
 if __name__ == "__main__":
